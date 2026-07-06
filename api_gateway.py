@@ -6,335 +6,279 @@ from google import genai
 
 app = Flask(__name__)
 
-# -------------------------
-# Gemini client
-# -------------------------
-client = genai.Client(
-    api_key=os.environ.get("GEMINI_API_KEY"),
-)
+# ── Models ────────────────────────────────────────────────────────────────
+ORCHESTRATOR_MODEL = "models/gemini-3-flash-preview"       # analysis + planning brain
+IMAGE_MODEL = "models/gemini-3.1-flash-lite-image"         # image generation engine
 
-# -------------------------
-# Models
-# -------------------------
-ORCHESTRATOR_MODEL = "models/gemini-3-flash-preview"
-IMAGE_MODEL = "models/gemini-3.1-flash-lite-image"
-
-# -------------------------
-# Tools for article analysis
-# -------------------------
-TOOLS = [
-    {"type": "google_search"},
-    {"type": "url_context"},
-]
-
-# -------------------------
-# Configs
-# -------------------------
-ORCHESTRATION_CONFIG = {
-    "temperature": 1.2,
-    "max_output_tokens": 65536,
-    "top_p": 0.95,
-    "thinking_level": "high",
-}
-
-IMAGE_CONFIG = {
-    "temperature": 1,
-    "max_output_tokens": 65536,
-    "top_p": 0.95,
-    "thinking_level": "low",
-    "image_config": {
-        "image_size": "1K",
-    },
-}
+MAX_IMAGES = 8  # hard cap so a long article doesn't burn your quota
 
 
-# -------------------------
-# Helpers
-# -------------------------
-def is_valid_url(url: str) -> bool:
-    return isinstance(url, str) and (
-        url.startswith("http://") or url.startswith("https://")
-    )
+def get_client():
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None, jsonify({"error": "Server configuration error: GEMINI_API_KEY not found."}), 500
+    return genai.Client(api_key=api_key), None, None
 
 
-def extract_text_parts(interaction):
+def extract_text_from_interaction(interaction):
+    """Collect all text parts from every model_output step."""
     texts = []
-    for step in getattr(interaction, "steps", []):
-        if getattr(step, "type", None) == "model_output" and getattr(step, "content", None):
+    for step in interaction.steps:
+        if step.type == "model_output" and step.content:
             for part in step.content:
-                if getattr(part, "type", None) == "text":
+                if part.type == "text" and part.text:
                     texts.append(part.text)
-    return "\n".join(texts).strip()
+    return "\n".join(texts)
 
 
-def extract_image_parts(interaction):
-    images = []
-    texts = []
-
-    for step in getattr(interaction, "steps", []):
-        if getattr(step, "type", None) == "model_output" and getattr(step, "content", None):
-            for part in step.content:
-                if getattr(part, "type", None) == "image":
-                    images.append(f"data:image/png;base64,{part.data}")
-                elif getattr(part, "type", None) == "text":
-                    texts.append(part.text)
-
-    return images, texts
-
-
-def parse_json_from_text(text: str):
-    """
-    Gemini may sometimes wrap JSON in markdown fences.
-    This helper extracts the JSON object safely.
-    """
-    if not text:
-        raise ValueError("Empty model response")
-
-    # Remove markdown fences if present
-    text = text.strip()
-    text = re.sub(r"^```json\s*", "", text)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-
-    # Try parsing directly first
+def parse_json_block(text):
+    """Robustly pull a JSON object out of model output (handles ```json fences)."""
+    cleaned = re.sub(r"```(?:json)?", "", text).strip().strip("`").strip()
+    # Try direct parse first
     try:
-        return json.loads(text)
+        return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-
-    # Fallback: extract first big JSON object
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("Could not find JSON object in model response.")
-
-    return json.loads(match.group(0))
+    # Fallback: grab the outermost { ... }
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(cleaned[start:end + 1])
+    raise ValueError("No valid JSON object found in orchestrator output.")
 
 
-def build_orchestration_prompt(article_url: str, max_images: int):
-    return f"""
-You are an expert editorial visual strategist and article-image planning agent.
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 1 — ORCHESTRATOR: navigate + analyze the article, plan image placements
+# ══════════════════════════════════════════════════════════════════════════
+
+ORCHESTRATOR_SYSTEM_PROMPT = """You are an expert editorial art director for premium online publications.
+
+You will be given the URL of an article. Use your url_context tool to read the FULL article
+(and google_search only if you need extra context about entities mentioned in it).
 
 Your job:
-1. Visit and analyze the full article at this URL: {article_url}
-2. Understand the full article deeply.
-3. Decide how many inline images the article needs, up to a maximum of {max_images}.
-4. Decide the best placement point for each image.
-5. Create extremely high-quality, highly detailed, editorial-grade, photorealistic image prompts for each placement.
+1. Deeply analyze the article: topic, narrative arc, tone, target audience, key sections.
+2. Decide EXACTLY where images should be placed for maximum reader engagement
+   (hero image, section breaks, concept illustrations, data/process visuals, closing image).
+3. For EACH placement, write a highly detailed, production-grade image generation prompt.
 
-The generated images must:
-- feel premium and publication-quality
-- be extremely realistic
-- be contextually accurate to the article
-- be visually compelling for article readers
-- avoid looking like generic stock images when possible
-- avoid text overlays inside the image
-- avoid watermarks
-- avoid surreal or obviously fake visual artifacts unless article context demands it
+PROMPT QUALITY RULES (critical):
+- Every prompt must produce a photorealistic / extremely realistic, high-quality editorial image.
+- Include: subject, setting, composition, camera angle, lens (e.g. 35mm, 85mm f/1.4),
+  lighting (golden hour, softbox, overcast), color palette, mood, texture and depth-of-field details.
+- Match the article's tone (serious news = documentary photography; lifestyle = warm candid; tech = clean modern).
+- NEVER include real people's names, celebrity likenesses, logos, brand marks, or any text/words to render in the image.
+- Each prompt must be self-contained (the image model will NOT see the article).
 
-Return STRICT JSON only.
-Do not include explanation outside JSON.
+Respond with ONLY a valid JSON object, no markdown fences, in this exact schema:
 
-Use this exact schema:
-
-{{
+{
   "article_title": "string",
-  "article_summary": "string",
-  "overall_visual_strategy": "string",
-  "recommended_image_count": 3,
+  "article_summary": "2-3 sentence summary",
+  "tone": "string",
   "images": [
-    {{
-      "image_number": 1,
-      "section_heading": "string",
-      "placement": "e.g. after introduction, after section 2, before conclusion",
-      "placement_reason": "string",
-      "purpose": "string",
-      "aspect_ratio": "16:9",
-      "alt_text": "string",
-      "prompt": "A very detailed photorealistic editorial image prompt",
-      "negative_prompt": "Avoid text, watermark, blur, distorted anatomy, extra fingers, bad composition, low detail, cartoon look"
-    }}
+    {
+      "id": 1,
+      "placement": "hero | after_section:<section heading> | after_paragraph:<first 8 words of the paragraph> | closing",
+      "purpose": "why an image belongs here",
+      "alt_text": "concise accessible alt text",
+      "caption": "suggested caption for the article",
+      "aspect_ratio": "16:9 | 4:3 | 1:1 | 3:4",
+      "image_prompt": "the full detailed generation prompt"
+    }
   ]
-}}
+}
 
-Rules:
-- Return between 1 and {max_images} images.
-- Prompt quality must be excellent and highly descriptive.
-- Prompts must be optimized for realistic article imagery.
-- Prompts must mention composition, lighting, realism, environment, subject details, mood, and publication-style quality.
-- If article is abstract or conceptual, still create realistic editorial-style imagery.
-"""
-    
-
-def build_image_generation_prompt(article_title: str, article_summary: str, item: dict):
-    base_prompt = item.get("prompt", "")
-    negative_prompt = item.get("negative_prompt", "")
-
-    return f"""
-Create a single extremely realistic, high-quality editorial article image.
-
-Article title:
-{article_title}
-
-Article summary:
-{article_summary}
-
-Section heading:
-{item.get("section_heading", "")}
-
-Image purpose:
-{item.get("purpose", "")}
-
-Placement:
-{item.get("placement", "")}
-
-Main prompt:
-{base_prompt}
-
-Requirements:
-- ultra realistic
-- premium editorial article image
-- highly detailed
-- natural lighting or cinematic realistic lighting as appropriate
-- accurate materials and textures
-- authentic human anatomy if people are present
-- visually rich but not exaggerated
-- suitable for a high-quality online article
-- no text inside the image
-- no watermark
-- no logo
-- no collage
-- single cohesive scene
-- strong composition
-- believable scene realism
-- avoid obvious AI look
-
-Negative guidance:
-{negative_prompt}
-"""
+Plan between 3 and 6 images unless the article is very short (then 1-2)."""
 
 
-# -------------------------
-# Main route
-# -------------------------
+def run_orchestrator(client, article_url, max_images):
+    tools = [
+        {"type": "google_search"},
+        {"type": "url_context"},
+    ]
+    generation_config = {
+        "temperature": 1.0,          # planning needs consistency more than wild creativity
+        "max_output_tokens": 65536,
+        "top_p": 0.95,
+        "thinking_level": "high",
+    }
+    interaction = client.interactions.create(
+        model=ORCHESTRATOR_MODEL,
+        input=(
+            ORCHESTRATOR_SYSTEM_PROMPT
+            + f"\n\nArticle URL to analyze: {article_url}"
+            + f"\nMaximum number of images allowed: {max_images}"
+        ),
+        tools=tools,
+        generation_config=generation_config,
+    )
+    raw_text = extract_text_from_interaction(interaction)
+    plan = parse_json_block(raw_text)
+
+    if "images" not in plan or not isinstance(plan["images"], list) or not plan["images"]:
+        raise ValueError("Orchestrator returned no image plan.")
+    plan["images"] = plan["images"][:max_images]
+    return plan
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 2 — IMAGE ENGINE: generate each planned image
+# ══════════════════════════════════════════════════════════════════════════
+
+def generate_single_image(client, prompt, image_size="2K"):
+    generation_config = {
+        "temperature": 1,
+        "max_output_tokens": 65536,
+        "top_p": 0.95,
+        "thinking_level": "low",
+        "image_config": {
+            "image_size": image_size,
+        },
+    }
+    interaction = client.interactions.create(
+        model=IMAGE_MODEL,
+        input=prompt,
+        generation_config=generation_config,
+        response_modalities=["image", "text"],
+    )
+    for step in interaction.steps:
+        if step.type == "model_output" and step.content:
+            for part in step.content:
+                if part.type == "image":
+                    return f"data:image/png;base64,{part.data}"
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ══════════════════════════════════════════════════════════════════════════
+
 @app.route("/generate-article-images", methods=["POST"])
 def generate_article_images():
     """
-    Request JSON:
+    Full agent pipeline: URL in → analyzed article → placement plan → generated images out.
+
+    Request body:
     {
-      "article_url": "https://example.com/article",
-      "max_images": 3
+      "url": "https://example.com/some-article",
+      "max_images": 5,          // optional, default 5, capped at MAX_IMAGES
+      "image_size": "2K",       // optional: "1K" | "2K" | "4K"
+      "plan_only": false        // optional: true = return the plan without generating images
     }
     """
+    client, err_resp, err_code = get_client()
+    if err_resp:
+        return err_resp, err_code
+
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON."}), 400
+
+    data = request.get_json()
+    article_url = (data.get("url") or "").strip()
+    if not article_url.startswith(("http://", "https://")):
+        return jsonify({"error": "Request JSON must include a valid 'url' field (http/https)."}), 400
+
+    max_images = min(int(data.get("max_images", 5)), MAX_IMAGES)
+    image_size = data.get("image_size", "2K")
+    plan_only = bool(data.get("plan_only", False))
+
+    # ---- Step 1: analyze + plan ----
+    try:
+        plan = run_orchestrator(client, article_url, max_images)
+    except Exception as e:
+        print(f"Orchestrator error: {e}")
+        return jsonify({"error": "Article analysis / planning failed.", "details": str(e)}), 502
+
+    if plan_only:
+        return jsonify({"success": True, "url": article_url, "plan": plan, "images_generated": 0})
+
+    # ---- Step 2: generate each planned image ----
+    results = []
+    generated = 0
+    for item in plan["images"]:
+        entry = {
+            "id": item.get("id"),
+            "placement": item.get("placement"),
+            "purpose": item.get("purpose"),
+            "alt_text": item.get("alt_text"),
+            "caption": item.get("caption"),
+            "aspect_ratio": item.get("aspect_ratio"),
+            "image_prompt": item.get("image_prompt"),
+            "imageUrl": None,
+            "status": "failed",
+        }
+        try:
+            image_url = generate_single_image(client, item["image_prompt"], image_size=image_size)
+            if image_url:
+                entry["imageUrl"] = image_url
+                entry["status"] = "ok"
+                generated += 1
+            else:
+                entry["error"] = "No image data returned by model."
+        except Exception as e:
+            print(f"Image generation error (id={item.get('id')}): {e}")
+            entry["error"] = str(e)
+        results.append(entry)
+
+    status_code = 200 if generated > 0 else 502
+    return jsonify({
+        "success": generated > 0,
+        "url": article_url,
+        "article_title": plan.get("article_title"),
+        "article_summary": plan.get("article_summary"),
+        "tone": plan.get("tone"),
+        "orchestrator_model": ORCHESTRATOR_MODEL,
+        "image_model": IMAGE_MODEL,
+        "images_planned": len(plan["images"]),
+        "images_generated": generated,
+        "images": results,
+    }), status_code
+
+
+@app.route("/generate", methods=["POST"])
+def generate_image():
+    """Legacy single-prompt image endpoint (kept for direct prompt → image use)."""
+    client, err_resp, err_code = get_client()
+    if err_resp:
+        return err_resp, err_code
+
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON."}), 400
+
+    data = request.get_json()
+    prompt = data.get("prompt")
+    if not prompt:
+        return jsonify({"error": "Request JSON must include a non-empty 'prompt' field."}), 400
 
     try:
-        if not request.is_json:
-            return jsonify({"error": "Request must be JSON."}), 400
-
-        data = request.get_json()
-        article_url = data.get("article_url")
-        max_images = int(data.get("max_images", 3))
-
-        if not article_url:
-            return jsonify({"error": "Missing 'article_url'."}), 400
-
-        if not is_valid_url(article_url):
-            return jsonify({"error": "Invalid 'article_url'. Must start with http:// or https://"}), 400
-
-        max_images = max(1, min(max_images, 8))
-
-        # ---------------------------------------
-        # Step 1: Analyze article and plan images
-        # ---------------------------------------
-        orchestration_prompt = build_orchestration_prompt(article_url, max_images)
-
-        orchestration_interaction = client.interactions.create(
-            model=ORCHESTRATOR_MODEL,
-            input=orchestration_prompt,
-            tools=TOOLS,
-            generation_config=ORCHESTRATION_CONFIG,
-        )
-
-        orchestration_text = extract_text_parts(orchestration_interaction)
-        plan = parse_json_from_text(orchestration_text)
-
-        article_title = plan.get("article_title", "")
-        article_summary = plan.get("article_summary", "")
-        images_plan = plan.get("images", [])
-
-        if not images_plan:
-            return jsonify({
-                "error": "The agent analyzed the article but did not return any image plan.",
-                "raw_response": orchestration_text
-            }), 500
-
-        # ---------------------------------------
-        # Step 2: Generate each image
-        # ---------------------------------------
-        generated_images = []
-
-        for item in images_plan:
-            prompt = build_image_generation_prompt(article_title, article_summary, item)
-
-            image_interaction = client.interactions.create(
-                model=IMAGE_MODEL,
-                input=prompt,
-                generation_config=IMAGE_CONFIG,
-                response_modalities=["image", "text"],
-            )
-
-            image_urls, text_outputs = extract_image_parts(image_interaction)
-
-            if not image_urls:
-                generated_images.append({
-                    "image_number": item.get("image_number"),
-                    "section_heading": item.get("section_heading"),
-                    "placement": item.get("placement"),
-                    "alt_text": item.get("alt_text"),
-                    "prompt": item.get("prompt"),
-                    "status": "failed",
-                    "error": "No image returned by model.",
-                    "model_text": text_outputs,
-                })
-                continue
-
-            generated_images.append({
-                "image_number": item.get("image_number"),
-                "section_heading": item.get("section_heading"),
-                "placement": item.get("placement"),
-                "placement_reason": item.get("placement_reason"),
-                "purpose": item.get("purpose"),
-                "aspect_ratio": item.get("aspect_ratio", "16:9"),
-                "alt_text": item.get("alt_text"),
-                "prompt": item.get("prompt"),
-                "negative_prompt": item.get("negative_prompt"),
-                "imageUrl": image_urls[0],
-                "images": image_urls,
-                "model_text": text_outputs,
-                "status": "success",
-            })
-
+        image_url = generate_single_image(client, prompt, image_size=data.get("image_size", "1K"))
+        if not image_url:
+            return jsonify({"error": "No image data found in Gemini response."}), 500
         return jsonify({
             "success": True,
-            "article_url": article_url,
-            "article_title": article_title,
-            "article_summary": article_summary,
-            "overall_visual_strategy": plan.get("overall_visual_strategy", ""),
-            "recommended_image_count": plan.get("recommended_image_count", len(generated_images)),
-            "image_plan": images_plan,
-            "generated_images": generated_images,
+            "model": IMAGE_MODEL,
+            "imageUrl": image_url,
+            "images": [image_url],
         })
-
     except Exception as e:
-        print(f"Error in /generate-article-images: {e}")
-        return jsonify({
-            "error": "Failed to analyze article and generate images.",
-            "details": str(e)
-        }), 500
+        print(f"Gemini image generation error: {e}")
+        return jsonify({"error": "Image generation failed.", "details": str(e)}), 502
 
 
-# -------------------------
-# Health route
-# -------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return "Article Image Agent is running!"
+    return jsonify({
+        "service": "Article Image Agent",
+        "description": "POST an article URL → agent reads it, plans image placements, "
+                       "writes detailed prompts, and generates hyper-realistic editorial images.",
+        "endpoints": {
+            "POST /generate-article-images": {"url": "required", "max_images": 5, "image_size": "2K", "plan_only": False},
+            "POST /generate": {"prompt": "required (legacy direct image gen)"},
+        },
+        "orchestrator_model": ORCHESTRATOR_MODEL,
+        "image_model": IMAGE_MODEL,
+    })
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
