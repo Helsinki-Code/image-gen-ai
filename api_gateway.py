@@ -189,7 +189,7 @@ def generate_article_images():
     max_images = data.get("max_images")  # None = agent decides dynamically
     if max_images is not None:
         max_images = max(1, int(max_images))
-    image_size = data.get("image_size", "2K")
+    image_size = data.get("image_size", "1K")  # flash-lite image model supports 1K only
     plan_only = bool(data.get("plan_only", False))
 
     # ---- Step 1: analyze + plan (agent decides the count) ----
@@ -225,7 +225,15 @@ def generate_article_images():
             "status": "failed",
         }
         try:
-            b64 = generate_single_image(client, item["image_prompt"], image_size=image_size)
+            try:
+                b64 = generate_single_image(client, item["image_prompt"], image_size=image_size)
+            except Exception as size_err:
+                # Graceful fallback: if the requested size is rejected, retry at 1K
+                if "size" in str(size_err).lower() and image_size != "1K":
+                    print(f"Size {image_size} rejected, retrying id={item.get('id')} at 1K")
+                    b64 = generate_single_image(client, item["image_prompt"], image_size="1K")
+                else:
+                    raise
             if b64:
                 entry["image_base64"] = b64
                 entry["imageUrl"] = f"data:image/png;base64,{b64}"
