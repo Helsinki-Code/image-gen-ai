@@ -46,12 +46,11 @@ def generate_image():
             "temperature": data.get("temperature", 1),
             "max_output_tokens": data.get("max_output_tokens", 65536),
             "top_p": data.get("top_p", 0.95),
-            "thinking_level": data.get("thinking_level", "minimal"),
+            "thinking_level": data.get("thinking_level", "low"),
             "image_config": {
                 "image_size": data.get("image_size", "1K"),
             },
         }
-
         interaction = client.interactions.create(
             model=MODEL_NAME,
             input=prompt,
